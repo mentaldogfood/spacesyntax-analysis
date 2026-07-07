@@ -92,6 +92,16 @@ from citywide_match import (
 
 SPECTRAL = plt.get_cmap("Spectral_r")  # blue=low, red=high (classic syntax palette)
 
+# --all-bias summary columns to rank across BIAs, 1 = best. ascending=False
+# means higher is better (rank 1 = highest); segment length flips this,
+# since a lower average segment length ranks best.
+RANK_COLUMNS = [
+    ("avg_blended_nain",            False),
+    ("avg_blended_nach",            False),
+    ("avg_segment_length",          True),
+    ("blended_nain_nach_pearson_r", False),
+]
+
 
 # ---------------------------------------------------------------------------
 # Stats
@@ -129,57 +139,6 @@ def compute_summary(gdf: gpd.GeoDataFrame) -> tuple[dict, float, float]:
         "pct_citywide_matched":         round(float(gdf["citywide_matched"].mean()) * 100, 2),
     }
     return summary, r_blend, p_blend
-
-
-# ---------------------------------------------------------------------------
-# Rendering
-# ---------------------------------------------------------------------------
-
-def render_map_png(
-    gdf:      gpd.GeoDataFrame,
-    bia:      gpd.GeoDataFrame,
-    col:      str,
-    title:    str,
-    out_path: Path,
-) -> None:
-    """Spectral line map for a single metric, saved as PNG."""
-    vals   = gdf[col].values.astype(float)
-    finite = vals[np.isfinite(vals)]
-    if len(finite) == 0:
-        print(f"  SKIP '{col}': no finite values")
-        return
-
-    vmin = np.percentile(finite, 2)
-    vmax = np.percentile(finite, 98)
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-
-    segs, colours = [], []
-    for geom, val in zip(gdf.geometry, vals):
-        if geom is None or geom.is_empty:
-            continue
-        coords = list(geom.coords)
-        for i in range(len(coords) - 1):
-            segs.append([coords[i], coords[i + 1]])
-            c = SPECTRAL(norm(val)) if np.isfinite(val) else (0.3, 0.3, 0.3, 0.4)
-            colours.append(c)
-
-    fig, ax = plt.subplots(figsize=(10, 10), facecolor="white")
-    ax.set_aspect("equal")
-    ax.axis("off")
-    ax.add_collection(LineCollection(segs, colors=colours, linewidths=0.8, zorder=2))
-    bia.to_crs(gdf.crs).boundary.plot(
-        ax=ax, color="crimson", linewidth=1.0, linestyle="--", zorder=5
-    )
-    sm = ScalarMappable(norm=norm, cmap=SPECTRAL)
-    sm.set_array([])
-    cb = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02, shrink=0.6)
-    cb.set_label(col, fontsize=8)
-    cb.ax.tick_params(labelsize=7)
-    ax.set_title(title, fontsize=11, fontweight="bold", pad=10)
-    ax.autoscale_view()
-    fig.savefig(out_path, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  PNG: {out_path.name}")
 
 
 def render_correlation_png(
@@ -296,10 +255,6 @@ def _run_one(
                            graph_path=out_graph, summary=summary)
 
             print("\nRendering maps...")
-            render_map_png(gdf, bia_gdf, "blended_nain", "NAIN (70% local / 30% citywide)",
-                           output_dir / f"{slug}_nain.png")
-            render_map_png(gdf, bia_gdf, "blended_nach", "NACH (70% local / 30% citywide)",
-                           output_dir / f"{slug}_nach.png")
             render_correlation_png(gdf, output_dir / f"{slug}_correlation.png", r, p)
 
             gdf = gdf.copy()
@@ -357,17 +312,13 @@ def main() -> None:
                 failed.append(name)
 
         if rows:
-            summary_df  = pd.DataFrame(rows)
+            summary_df = pd.DataFrame(rows)
+            for col, ascending in RANK_COLUMNS:
+                summary_df[f"{col}_rank"] = summary_df[col].rank(ascending=ascending, method="min").astype(int)
+
             summary_csv = OUTPUT_ROOT / "all_bia_summary.csv"
             summary_df.to_csv(summary_csv, index=False)
             print(f"\nSummary written to: {summary_csv}")
-
-            summary_xlsx = OUTPUT_ROOT / "space_syntax_summary.xlsx"
-            try:
-                summary_df.to_excel(summary_xlsx, sheet_name="BIA Summary", index=False)
-                print(f"Excel summary written to: {summary_xlsx}")
-            except PermissionError:
-                print(f"Excel summary skipped -- file is open elsewhere")
 
         if gdfs:
             merged = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)

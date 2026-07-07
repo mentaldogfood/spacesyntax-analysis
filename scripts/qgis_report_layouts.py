@@ -1,19 +1,31 @@
 """
-qgis_report_layouts.py -- build one print-quality report layout + PNG per BIA.
+qgis_report_layouts.py -- build map layout PNGs for each BIA.
 
-For every BIA: loads in the geopackage as a project layer, applies a style, then creates a named print layout with:
-  - a map item with base vector tiles and the BIA's centerlines filling the full page
-  - a legend for the integration value, from low (0) to high (2)
-  - a title label showing the BIA name
-Then exports each layout to outputs/BIAName_print_map.png.
+For every BIA, for each requested map type (integration / choice / segment length): loads the BIA's gpkg as a
+project layer, applies that map type's shared style, then creates/replaces a named print
+layout with:
+  - a map item pinned to that BIA's layer + basemap, filling the full page
+    (297x210mm), zoomed to the extent of that BIA's centerlines
+  - a legend
+  - a title label showing the BIA name, map type, and its rank for that metric
+Then exports each layout to outputs/<slug>/<slug>_<maptype>_print_map.png.
+
+Usage (must be run with QGIS's own Python, not the pipeline's venv):
+    "C:\\Program Files\\QGIS <version>\\bin\\python-qgis.bat" scripts\\qgis_report_layouts.py
+    (the exact bin name depends on your install -- python-qgis-ltr.bat for the LTR line)
+
+    --maps all                       (default) export all three map types
+    --maps integration                export only the integration maps
+    --maps choice segment_length      export choice + segment length maps
 
 Set LIMIT_TO below to a list of BIA names to process only those (for testing);
 leave empty to process all BIAs.
 
-Requires "spatial syntax processing.qgz" which is included in the repo
+Requires "spatial syntax processing.qgz" (in the repo root)
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import sys
 from pathlib import Path
@@ -42,22 +54,59 @@ PROJECT_PATH   = ANALYSIS_DIR / "spatial syntax processing.qgz"
 OUTPUT_ROOT    = ANALYSIS_DIR / "outputs"
 BIAS_GEOJSON   = ANALYSIS_DIR / "inputs" / "all bia boundaries.geojson"
 
-MAP_STYLE_SOURCE_LAYER = "Downtown_Yonge_segment_scores"  # renderer cloned onto every BIA's map layer
-LEGEND_SOURCE_LAYER    = "Integration"                     # legend content is ALWAYS this layer's
-CONTEXT_LAYER_NAMES    = ["VersaTiles Graybeard copy"]
-MARGIN_FRACTION     = 0.03  # extra space around each BIA's centerlines extent
-PAGE_WIDTH_MM       = 297.0
-PAGE_HEIGHT_MM      = 210.0
-EXPORT_DPI          = 300
+CONTEXT_LAYER_NAMES = ["VersaTiles Graybeard copy"]
+MARGIN_FRACTION      = 0.03  # extra space around each BIA's centerlines extent
+PAGE_WIDTH_MM        = 297.0
+PAGE_HEIGHT_MM       = 210.0
+EXPORT_DPI           = 300
+
+# One entry per exportable map type. style_source_layer's renderer is cloned
+# onto each BIA's data layer (the actual map colours); legend_source_layer is
+# a standalone reference layer used only to draw the on-page Legend, so every
+# BIA's page for a given map type is pixel-identical there. rank_col is the
+# precomputed "<metric>_rank" column in outputs/all_bia_summary.csv (1 = best;
+# main.py already accounts for segment length ranking lower-is-better) used
+# for the "(n/86)" title suffix.
+# sparse_labels=True blanks every bin except the first/last ("Low"/"High");
+# False leaves the layer's own per-bin labels untouched (Segment Length's
+# bins are already labelled with real metre ranges in the qgz).
+MAP_TYPE_DEFS = {
+    "integration": dict(
+        style_source_layer="Integration",
+        legend_source_layer="Integration",
+        rank_col="avg_blended_nain_rank",
+        label="Integration",
+        sparse_labels=True,
+    ),
+    "choice": dict(
+        style_source_layer="Choice",
+        legend_source_layer="Choice",
+        rank_col="avg_blended_nach_rank",
+        label="Choice",
+        sparse_labels=True,
+    ),
+    "segment_length": dict(
+        style_source_layer="Segment Length",
+        legend_source_layer="Segment Length",
+        rank_col="avg_segment_length_rank",
+        label="Segment Length",
+        sparse_labels=False,
+    ),
+}
 
 # Set to e.g. ["Downtown Yonge", "Korea Town", "Wilson Village"] to test a
 # handful of BIAs only. Leave as [] to process all.
 LIMIT_TO: list[str] = []
-
-# Custom QgsLayerTree roots handed to legend.model().setRootGroup() may not be
-# fully owned by the C++ side -- keep a Python reference alive for the whole
-# run so they can't be garbage-collected out from under a legend mid-script.
 _KEEP_ALIVE: list = []
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    p.add_argument(
+        "--maps", nargs="+", choices=[*MAP_TYPE_DEFS, "all"], default=["all"],
+        help="Which map type(s) to export (default: all)",
+    )
+    return p.parse_args()
 
 
 def get_bia_names() -> list[str]:
@@ -72,15 +121,16 @@ def slugify(name: str) -> str:
     return name.strip().replace(" ", "_").replace("/", "-")
 
 
-def load_rankings() -> tuple[dict[str, int], int]:
-    """Return ({bia_name: rank}, total) ranked by avg_blended_nain, 1 = highest."""
+def load_summary_rows() -> list[dict]:
     summary_csv = OUTPUT_ROOT / "all_bia_summary.csv"
-    rows = []
     with open(summary_csv, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            rows.append((row["bia"], float(row["avg_blended_nain"])))
-    rows.sort(key=lambda r: r[1], reverse=True)
-    ranks = {name: i + 1 for i, (name, _) in enumerate(rows)}
+        return list(csv.DictReader(f))
+
+
+def rank_lookup(rows: list[dict], col: str) -> tuple[dict[str, int], int]:
+    """Return ({bia_name: rank}, total) reading the precomputed rank column
+    `col` (1 = best) straight from all_bia_summary.csv."""
+    ranks = {row["bia"]: int(row[col]) for row in rows}
     return ranks, len(rows)
 
 
@@ -93,10 +143,11 @@ def _find_by_source(project: QgsProject, gpkg: Path):
     return None
 
 
-def ensure_layer(project: QgsProject, name: str, slug: str, style_renderer) -> QgsVectorLayer | None:
+def ensure_layer(project: QgsProject, slug: str) -> QgsVectorLayer | None:
+    """Load (or reload) this BIA's scored layer into the project. Caller is
+    responsible for setting a renderer before rendering/exporting it."""
     gpkg = OUTPUT_ROOT / slug / f"{slug}_segment_scores.gpkg"
     if not gpkg.exists():
-        print(f"  SKIP (no gpkg): {name}")
         return None
 
     old = _find_by_source(project, gpkg)
@@ -105,9 +156,7 @@ def ensure_layer(project: QgsProject, name: str, slug: str, style_renderer) -> Q
 
     lyr = QgsVectorLayer(str(gpkg), f"{slug}_segment_scores", "ogr")
     if not lyr.isValid():
-        print(f"  SKIP (invalid layer): {name}")
         return None
-    lyr.setRenderer(style_renderer.clone())
     project.addMapLayer(lyr)
     return lyr
 
@@ -122,17 +171,17 @@ def centerlines_extent(slug: str) -> QgsRectangle | None:
     return lyr.extent()
 
 
-def build_layout(project: QgsProject, bia_name: str, slug: str, data_layer: QgsVectorLayer,
-                  context_layers: list, legend_source_layer: QgsVectorLayer,
-                  rank_suffix: str = "") -> QgsPrintLayout:
+def build_layout(project: QgsProject, layout_name: str, title_text: str, slug: str,
+                  data_layer: QgsVectorLayer, context_layers: list,
+                  legend_source_layer: QgsVectorLayer, sparse_labels: bool) -> QgsPrintLayout:
     manager = project.layoutManager()
-    old = manager.layoutByName(bia_name)
+    old = manager.layoutByName(layout_name)
     if old is not None:
         manager.removeLayout(old)
 
     layout = QgsPrintLayout(project)
     layout.initializeDefaults()
-    layout.setName(bia_name)
+    layout.setName(layout_name)
     page = layout.pageCollection().page(0)
     page.setPageSize(QgsLayoutSize(PAGE_WIDTH_MM, PAGE_HEIGHT_MM, QgsUnitTypes.LayoutMillimeters))
 
@@ -153,7 +202,7 @@ def build_layout(project: QgsProject, bia_name: str, slug: str, data_layer: QgsV
 
     # -- Title label -----------------------------------------------------
     title = QgsLayoutItemLabel(layout)
-    title.setText(f"{bia_name} {rank_suffix}".strip())
+    title.setText(title_text)
     tf = QgsTextFormat()
     font = tf.font()
     font.setBold(True)
@@ -164,12 +213,10 @@ def build_layout(project: QgsProject, bia_name: str, slug: str, data_layer: QgsV
     title.attemptResize(QgsLayoutSize(PAGE_WIDTH_MM - 16, 12, QgsUnitTypes.LayoutMillimeters))
     layout.addLayoutItem(title)
 
-    # -- Legend: always the standalone "Integration" layer's own gradient,
-    # never the per-BIA data layer -- so every page is pixel-identical here.
-    # All bins stay visible (for the continuous-gradient look); only the
-    # first ("Low") and last ("High") get a text label, rest are blanked.
-    # No separate item-level title -- the layer's own name ("Integration")
-    # is already the heading; a second title would just duplicate it.
+    # -- Legend: always the standalone reference layer's own gradient, never
+    # the per-BIA data layer -- so every page for this map type is
+    # pixel-identical here. No separate item-level title -- the layer's own
+    # name is already the heading; a second title would just duplicate it.
     legend = QgsLayoutItemLegend(layout)
     legend.setLinkedMap(map_item)
     legend.setTitle("")
@@ -179,8 +226,11 @@ def build_layout(project: QgsProject, bia_name: str, slug: str, data_layer: QgsV
     legend.model().setRootGroup(root)
     _KEEP_ALIVE.append(root)
 
-    node_count = len(legend.model().layerLegendNodes(lt_layer))
-    if node_count >= 1:
+    # sparse_labels: blank all bins but the first/last ("Low"/"High"), for
+    # the continuous-gradient look. Otherwise leave the layer's own per-bin
+    # labels as configured in the qgz (e.g. Segment Length's metre ranges).
+    if sparse_labels:
+        node_count = len(legend.model().layerLegendNodes(lt_layer))
         for idx in range(node_count):
             if idx == 0:
                 label = "Low"
@@ -189,7 +239,7 @@ def build_layout(project: QgsProject, bia_name: str, slug: str, data_layer: QgsV
             else:
                 label = ""
             QgsMapLayerLegendUtils.setLegendNodeUserLabel(lt_layer, idx, label)
-        legend.model().refreshLayerLegend(lt_layer)
+    legend.model().refreshLayerLegend(lt_layer)
 
     legend.setSymbolHeight(2.5)
     legend.setSymbolWidth(8)
@@ -214,7 +264,40 @@ def export_png(layout: QgsPrintLayout, out_path: Path) -> bool:
     return result == QgsLayoutExporter.Success
 
 
+def resolve_map_types(project: QgsProject, keys: list[str], summary_rows: list[dict]) -> dict:
+    """Resolve each requested map type's style renderer, legend layer, and
+    per-metric ranking up front (once), so the per-BIA loop can just clone."""
+    resolved = {}
+    for key in keys:
+        cfg = MAP_TYPE_DEFS[key]
+
+        style_layers = project.mapLayersByName(cfg["style_source_layer"])
+        if not style_layers:
+            sys.exit(f"ERROR: style-source layer '{cfg['style_source_layer']}' not found "
+                      f"in project (map type: {key})")
+        style_layer = style_layers[0]
+
+        legend_layers = project.mapLayersByName(cfg["legend_source_layer"])
+        if not legend_layers:
+            sys.exit(f"ERROR: legend-source layer '{cfg['legend_source_layer']}' not found "
+                      f"in project (map type: {key})")
+
+        ranks, total = rank_lookup(summary_rows, cfg["rank_col"])
+        resolved[key] = dict(
+            style_renderer=style_layer.renderer().clone(),
+            legend_layer=legend_layers[0],
+            label=cfg["label"],
+            sparse_labels=cfg["sparse_labels"],
+            ranks=ranks,
+            total=total,
+        )
+    return resolved
+
+
 def main() -> None:
+    args = parse_args()
+    selected = list(MAP_TYPE_DEFS) if "all" in args.maps else list(dict.fromkeys(args.maps))
+
     qgs = QgsApplication([], False)
     qgs.initQgis()
 
@@ -222,20 +305,6 @@ def main() -> None:
     if not project.read(str(PROJECT_PATH)):
         sys.exit(f"ERROR: could not open project {PROJECT_PATH}")
     print(f"Opened project: {PROJECT_PATH}")
-
-    style_source_slug = slugify(MAP_STYLE_SOURCE_LAYER.removesuffix("_segment_scores"))
-    style_source_gpkg = OUTPUT_ROOT / style_source_slug / f"{style_source_slug}_segment_scores.gpkg"
-    style_layer = project.mapLayersByName(MAP_STYLE_SOURCE_LAYER)
-    style_layer = style_layer[0] if style_layer else _find_by_source(project, style_source_gpkg)
-    if style_layer is None:
-        sys.exit(f"ERROR: style-source layer '{MAP_STYLE_SOURCE_LAYER}' not found in project "
-                  f"(also checked source path {style_source_gpkg})")
-    style_renderer = style_layer.renderer().clone()
-
-    legend_layers = project.mapLayersByName(LEGEND_SOURCE_LAYER)
-    if not legend_layers:
-        sys.exit(f"ERROR: legend-source layer '{LEGEND_SOURCE_LAYER}' not found in project")
-    legend_source_layer = legend_layers[0]
 
     context_layers = []
     for cname in CONTEXT_LAYER_NAMES:
@@ -245,30 +314,39 @@ def main() -> None:
         else:
             print(f"  WARNING: context layer not found, skipping: {cname}")
 
-    ranks, total = load_rankings()
+    summary_rows = load_summary_rows()
+    resolved = resolve_map_types(project, selected, summary_rows)
 
     names = LIMIT_TO if LIMIT_TO else get_bia_names()
-    print(f"{len(names)} BIAs to process\n", flush=True)
+    print(f"{len(names)} BIAs x {len(selected)} map type(s) "
+          f"({', '.join(selected)}) = {len(names) * len(selected)} exports\n", flush=True)
 
     built, skipped, failed = 0, [], []
     for i, name in enumerate(names, 1):
         slug = slugify(name)
-        try:
-            lyr = ensure_layer(project, name, slug, style_renderer)
-            if lyr is None:
-                skipped.append(name)
-                continue
-            rank = ranks.get(name)
-            rank_suffix = f"({rank}/{total})" if rank is not None else ""
-            layout = build_layout(project, name, slug, lyr, context_layers,
-                                   legend_source_layer, rank_suffix)
-            png_path = OUTPUT_ROOT / slug / f"{slug}_print_map.png"
-            ok = export_png(layout, png_path)
-            built += 1
-            print(f"  [{i}/{len(names)}] {'ok' if ok else 'EXPORT FAILED'}: {name} -> {png_path.name}", flush=True)
-        except Exception as exc:
-            failed.append(name)
-            print(f"  [{i}/{len(names)}] FAILED: {name} -- {exc}", flush=True)
+        lyr = ensure_layer(project, slug)
+        if lyr is None:
+            skipped.append(name)
+            print(f"  [{i}/{len(names)}] SKIP (no gpkg): {name}", flush=True)
+            continue
+
+        for key in selected:
+            cfg = resolved[key]
+            try:
+                lyr.setRenderer(cfg["style_renderer"].clone())
+                rank = cfg["ranks"].get(name)
+                rank_suffix = f"({rank}/{cfg['total']})" if rank is not None else ""
+                title_text = f"{name} — {cfg['label']} {rank_suffix}".strip()
+                layout = build_layout(project, f"{name} — {cfg['label']}", title_text, slug,
+                                       lyr, context_layers, cfg["legend_layer"], cfg["sparse_labels"])
+                png_path = OUTPUT_ROOT / slug / f"{slug}_{key}_print_map.png"
+                ok = export_png(layout, png_path)
+                built += 1
+                print(f"  [{i}/{len(names)}] {key}: {'ok' if ok else 'EXPORT FAILED'} "
+                      f"-> {png_path.name}", flush=True)
+            except Exception as exc:
+                failed.append(f"{name} ({key})")
+                print(f"  [{i}/{len(names)}] {key}: FAILED -- {exc}", flush=True)
 
         if i % 10 == 0:
             project.write(str(PROJECT_PATH))

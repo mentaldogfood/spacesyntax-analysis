@@ -6,66 +6,8 @@ Each of the 86 BIA's total NAIN/NACH is a weighted average of its own local segm
 
 Scores are joined back to the road geometry and exported as scored GPKG/MIF, PNG, along with other key statistics which have been produced for the entire set of road segments for each BIA. Those can be found in the /outputs folder.
 
-There is also a city-wide excel worksheet which accumulates the summary statistics for all 86 BIAs, then ranks the top and bottom 5 for each category. 
+There is also a city-wide summary CSV which accumulates the summary statistics for all 86 BIAs, with each BIA ranked (1 = best) on blended NAIN, blended NACH, average segment length (lower ranks better here), and the blended NAIN-NACH Pearson r.
 
-## Requirements
-
-```
-pip install -r requirements.txt
-```
-
-The DepthmapX CLI, developed by Space Syntax at UCL, is already attached within the repo. However you could find them here:
-
-DepthmapX CLI download: https://github.com/SpaceGroupUCL/depthmapX/releases
-
-
-## Usage
-
-main.py — runs full Space Syntax pipeline for any, or all of Toronto BIAs.
-
-1. extract_bia: clip road centrelines to buffered BIA boundaries, then export as DXF
-
-2. depthmapx_segment: run depthmapXcli angular segment analysis, compute derived metrics, export .graph/MIF/GPKG/CSV
-
-3. citywide_match: match each local segment to its citywide counterpart (which I pregenerated manually using the depthmapX GUI, as the file citywide_Segment_Map.csv). 
-                          
-the spatial join was performed based on proximity, within a distance tolerance. the local + citywide NAIN/NACH is also weighted in this step.
-
-4. outputs/summary stats: avg local/citywide/blended NAIN & NACH, avg segment length, blended NAIN-NACH Pearson r, % of segments matched to a citywide counterpart — appended as a summary section in segment_scores.csv, and rolled up across all BIAs into outputs/all_bia_summary.csv + outputs/space_syntax_summary.xlsx
-
-5. outputs/visualization: NAIN spectral map, NACH spectral map, blended NAIN-NACH scatter plot as PNGs, GPKG and MIF files for each BIA to process using GIS softwares
-
-
-Running the analysis
-```
-Running full analysis on one BIA:
-
-python scripts/main.py --bia "Downtown Yonge"
-
-Checking list of BIA names:
-
-python scripts/main.py --list-bias
-
-Running full analysis on all BIAs:
-
-python scripts/main.py --all-bias
-```
-
-Options for the local/citywide blend:
-```
-adjusting weight on the local score (citywide gets 1 - this)
-
---local-weight 0.7          
-```
-Or if you only want the dxfs, after buffering and clipping:
-```
-python scripts/extract_bia.py --bia "Bloor West Village"
-python scripts/extract_bia.py --list-bias
-```
-And to run statistics on the city-wide NACH and NAIN data
-```
-python scripts/citywide_analysis.py
-```
 ## Methodology
 
 Key statistical terms and formulas are derived from these pieces of literature
@@ -102,3 +44,54 @@ Default `local_weight` = 0.7 (70% local / 30% citywide).
 Measure accessibility, or how closely aligned are the well-integrated streets with the high commuter-traffic streets.
 
 =corr(NAIN, NACH)
+
+## Requirements
+
+```
+pip install -r requirements.txt
+```
+
+The DepthmapX CLI, developed by Space Syntax at UCL, is already attached within the repo. However you could find them here:
+
+DepthmapX CLI download: https://github.com/SpaceGroupUCL/depthmapX/releases
+
+## Usage
+
+1. extract_bia: clip road centrelines to buffered BIA boundaries, then export as DXF
+
+2. depthmapx_segment: run depthmapXcli angular segment analysis, compute derived metrics, export .graph/MIF/GPKG/CSV
+
+3. citywide_match: match each local segment to its citywide counterpart (which I pregenerated manually using the depthmapX GUI, as the file citywide_Segment_Map.csv). 
+                          
+the spatial join was performed based on proximity, within a distance tolerance. the local + citywide NAIN/NACH is also weighted in this step.
+
+4. qgis_report_layouts: aggregate blended NACH and NAIN values, computes their Pearson R correlation, ranks each BIA for each metric, then exports to PyQGIS for visuals. 
+
+
+Running full analysis on one BIA:
+```
+python scripts/main.py --bia "Downtown Yonge"
+```
+Checking list of BIA names:
+```
+python scripts/main.py --list-bias
+```
+Running full analysis on all BIAs:
+```
+python scripts/main.py --all-bias
+```
+Adjusting weight on the local integration score (citywide gets 1 - this)
+```
+--local-weight 0.7          
+```
+Or if you only want the dxfs, after buffering and clipping:
+```
+python scripts/extract_bia.py --bia "Bloor West Village"
+```
+To build print-quality QGIS report layouts (must run with QGIS's own Python editor):
+```
+python scripts/qgis_report_layouts.py
+python scripts/qgis_report_layouts.py --maps integration
+python scripts/qgis_report_layouts.py --maps choice
+python scripts/qgis_report_layouts.py --maps segment_length
+```
