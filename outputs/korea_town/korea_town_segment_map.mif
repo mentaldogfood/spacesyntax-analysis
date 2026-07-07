@@ -2,7 +2,7 @@ Version 300
 Charset "Neutral"
 Delimiter ","
 CoordSys Earth Projection 8, 74, "m", -81, 0, 0.9996, 500000, 0
-Columns 13
+Columns 16
   T1024_Choice LargeInt
   T1024_Integration Float
   T1024_Node_Count LargeInt
@@ -10,12 +10,15 @@ Columns 13
   Angular_Connectivity Float
   Connectivity LargeInt
   Segment_Length Float
-  nain Float
-  nach Float
+  local_nain Float
+  local_nach Float
   integrated Float
-  length_penalty Float
-  NAIN_adjusted Float
-  NACH_adjusted Float
+  citywide_nain Float
+  citywide_nach Float
+  citywide_match_distance_m Float
+  citywide_matched Logical
+  blended_nain Float
+  blended_nach Float
 Data
 
 Line 626345.033929 4835824.49381 626415.432848 4835847.2009

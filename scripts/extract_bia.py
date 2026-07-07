@@ -32,10 +32,14 @@ BIA_BUFFER_M = 800.0
 # Data loading
 # ---------------------------------------------------------------------------
 
-def list_bias() -> None:
+def get_bia_names() -> list[str]:
     bias = gpd.read_file(BIAS_FILE)
+    return sorted(bias["AREA_NAME"].dropna().tolist())
+
+
+def list_bias() -> None:
     print("Available BIAs:")
-    for name in sorted(bias["AREA_NAME"].dropna().tolist()):
+    for name in get_bia_names():
         print(f"  {name}")
 
 

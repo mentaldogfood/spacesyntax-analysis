@@ -50,6 +50,7 @@ TORONTO_CRS = "EPSG:26917"
 _RESEARCH   = BASE.parent
 
 _CLI_CANDIDATES = [
+    BASE / "depthmapXcli_win64.exe",
     _RESEARCH / "depthmapXcli_win64.exe",
     Path.home() / "Downloads" / "depthmapXcli_win64.exe",
 ]
@@ -177,50 +178,11 @@ def add_derived_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df["integrated"] = itg * np.log(ch + 2)
     return df
 
-
-def apply_length_penalty(
-    df:         pd.DataFrame,
-    length_col: str   = "Segment Length",
-    strength:   float = 0.3,
-    exponent:   float = 1.5,
-) -> pd.DataFrame:
-    """
-    Reduce NAIN/NACH scores for longer segments within this BIA.
-
-    Long uninterrupted segments are penalised because they imply fewer
-    crossing points and coarser urban fabric, regardless of raw syntax scores.
-
-    penalty = 1 - (normalised_length ** exponent) * strength
-      - normalised_length is min-max scaled within the BIA (0 = shortest, 1 = longest)
-      - the longest segment receives the maximum reduction (= strength, default 30%)
-      - the shortest segment receives no reduction
-
-    Adds three columns to a copy of df:
-      length_penalty   — the multiplier (0.7 – 1.0 with defaults)
-      NAIN_adjusted    — nain * length_penalty
-      NACH_adjusted    — nach * length_penalty
-    Raw nain/nach columns are not modified.
-    """
-    df = df.copy()
-    lengths = df[length_col].astype(float)
-    lo, hi  = lengths.min(), lengths.max()
-    if hi > lo:
-        norm_len = (lengths - lo) / (hi - lo)
-    else:
-        norm_len = pd.Series(0.0, index=df.index)
-
-    df["length_penalty"] = 1.0 - (norm_len ** exponent) * strength
-    df["NAIN_adjusted"]  = df["nain"] * df["length_penalty"]
-    df["NACH_adjusted"]  = df["nach"] * df["length_penalty"]
-    return df
-
-
 # ---------------------------------------------------------------------------
 # Build GeoDataFrame from result coordinates
 # ---------------------------------------------------------------------------
 
-_ALL_SCORE_COLS = _DMX_COLS + ["nain", "nach", "integrated",
-                               "length_penalty", "NAIN_adjusted", "NACH_adjusted"]
+_ALL_SCORE_COLS = _DMX_COLS + ["nain", "nach", "integrated"]
 
 
 def build_geodataframe(result_df: pd.DataFrame, crs: str) -> gpd.GeoDataFrame:
@@ -272,6 +234,18 @@ def export_results(
         print(f"  MIF           : {mif_path.name}")
     except Exception as exc:
         print(f"  MIF export failed ({exc}); skipping")
+
+    gpkg_path = out_dir / f"{slug}_segment_scores.gpkg"
+    if gpkg_path.exists():
+        try:
+            gpkg_path.unlink()
+        except PermissionError:
+            pass  # file locked (e.g. open in QGIS); overwrite in place
+    try:
+        gdf.to_file(gpkg_path, driver="GPKG")
+        print(f"  GPKG          : {gpkg_path.name}")
+    except Exception as exc:
+        print(f"  GPKG export failed ({exc}); skipping")
 
     score_cols = [c for c in gdf.columns if c != "geometry"]
     csv_path = out_dir / f"{slug}_segment_scores.csv"

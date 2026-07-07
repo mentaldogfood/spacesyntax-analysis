@@ -1,21 +1,8 @@
-﻿"""
-main.py — full Space Syntax pipeline for Toronto BIAs.
-
-Orchestrates:
-  1. extract_bia        : clip road centrelines, export DXF
-  2. depthmapx_segment  : run depthmapXcli angular segment analysis,
-                          compute derived metrics, export .graph / MIF / CSV
-  3. Summary stats      : avg NAIN, avg NACH, avg segment length, NAIN-NACH Pearson r
-                          appended as a summary section in segment_scores.csv
-  4. PNG maps           : NAIN spectral map, NACH spectral map, NAIN-NACH scatter plot
-
-Usage:
-    python scripts/main.py --bia "Downtown Yonge"
-    python scripts/main.py --list-bias
-"""
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import sys
 from pathlib import Path
 
@@ -84,15 +71,23 @@ from extract_bia import (
     TORONTO_CRS,
     BIA_BUFFER_M,
     extract_bia,
+    get_bia_names,
     list_bias,
 )
 from depthmapx_segment import (
     DEFAULT_EXE,
     add_derived_metrics,
-    apply_length_penalty,
     build_geodataframe,
     export_results,
     run_depthmapxcli,
+)
+from citywide_match import (
+    CITYWIDE_CSV,
+    DEFAULT_LOCAL_WEIGHT,
+    DEFAULT_MATCH_TOLERANCE_M,
+    attach_citywide,
+    blend_scores,
+    load_citywide,
 )
 
 SPECTRAL = plt.get_cmap("Spectral_r")  # blue=low, red=high (classic syntax palette)
@@ -104,38 +99,36 @@ SPECTRAL = plt.get_cmap("Spectral_r")  # blue=low, red=high (classic syntax pale
 
 def compute_summary(gdf: gpd.GeoDataFrame) -> tuple[dict, float, float]:
     """
-    Return (summary_dict, r_raw, p_raw).
+    Return (summary_dict, r_blend, p_blend).
 
-    summary_dict contains parallel raw and adjusted stat blocks, ready to
-    pass to export_results. r_raw / p_raw are the raw NAIN-NACH Pearson
-    values used for the scatter plot title.
+    r_blend / p_blend are the blended NAIN-NACH Pearson values used for the
+    scatter plot title.
     """
     def _finite(col: str):
         v = gdf[col]
         return gdf.loc[v.notna() & np.isfinite(v), col].values
 
-    nain_raw = _finite("nain")
-    nach_raw = _finite("nach")
-    r_raw, p_raw = pearsonr(nain_raw, nach_raw)
-
-    nain_adj = _finite("NAIN_adjusted")
-    nach_adj = _finite("NACH_adjusted")
-    r_adj, p_adj = pearsonr(nain_adj, nach_adj)
+    local_nain = _finite("local_nain")
+    local_nach = _finite("local_nach")
+    cw_nain    = _finite("citywide_nain")
+    cw_nach    = _finite("citywide_nach")
+    blend_nain = _finite("blended_nain")
+    blend_nach = _finite("blended_nach")
+    r_blend, p_blend = pearsonr(blend_nain, blend_nach)
 
     summary = {
-        # --- raw ---
-        "avg_nain_raw":                 round(float(nain_raw.mean()), 6),
-        "avg_nach_raw":                 round(float(nach_raw.mean()), 6),
+        "avg_local_nain":              round(float(local_nain.mean()), 6),
+        "avg_local_nach":               round(float(local_nach.mean()), 6),
+        "avg_citywide_nain":            round(float(cw_nain.mean()), 6),
+        "avg_citywide_nach":            round(float(cw_nach.mean()), 6),
+        "avg_blended_nain":             round(float(blend_nain.mean()), 6),
+        "avg_blended_nach":             round(float(blend_nach.mean()), 6),
         "avg_segment_length":           round(float(gdf["Segment Length"].mean()), 4),
-        "nain_nach_pearson_r_raw":      round(r_raw, 6),
-        "nain_nach_p_value_raw":        f"{p_raw:.4e}",
-        # --- length-penalty adjusted ---
-        "avg_nain_adjusted":            round(float(nain_adj.mean()), 6),
-        "avg_nach_adjusted":            round(float(nach_adj.mean()), 6),
-        "nain_nach_pearson_r_adjusted": round(r_adj, 6),
-        "nain_nach_p_value_adjusted":   f"{p_adj:.4e}",
+        "blended_nain_nach_pearson_r":  round(r_blend, 6),
+        "blended_nain_nach_p_value":    f"{p_blend:.4e}",
+        "pct_citywide_matched":         round(float(gdf["citywide_matched"].mean()) * 100, 2),
     }
-    return summary, r_raw, p_raw
+    return summary, r_blend, p_blend
 
 
 # ---------------------------------------------------------------------------
@@ -195,13 +188,13 @@ def render_correlation_png(
     r:        float,
     p:        float,
 ) -> None:
-    """Scatter plot of NAIN vs NACH with regression line."""
+    """Scatter plot of blended NAIN vs blended NACH with regression line."""
     mask = (
-        gdf["nain"].notna() & gdf["nach"].notna()
-        & np.isfinite(gdf["nain"]) & np.isfinite(gdf["nach"])
+        gdf["blended_nain"].notna() & gdf["blended_nach"].notna()
+        & np.isfinite(gdf["blended_nain"]) & np.isfinite(gdf["blended_nach"])
     )
-    nain = gdf.loc[mask, "nain"].values
-    nach = gdf.loc[mask, "nach"].values
+    nain = gdf.loc[mask, "blended_nain"].values
+    nach = gdf.loc[mask, "blended_nach"].values
 
     m, b  = np.polyfit(nain, nach, 1)
     x_fit = np.linspace(nain.min(), nain.max(), 300)
@@ -209,10 +202,10 @@ def render_correlation_png(
     fig, ax = plt.subplots(figsize=(7, 6), facecolor="white")
     ax.scatter(nain, nach, s=4, alpha=0.35, color="steelblue", linewidths=0)
     ax.plot(x_fit, m * x_fit + b, color="crimson", linewidth=1.5)
-    ax.set_xlabel("NAIN", fontsize=10)
-    ax.set_ylabel("NACH", fontsize=10)
+    ax.set_xlabel("NAIN (blended)", fontsize=10)
+    ax.set_ylabel("NACH (blended)", fontsize=10)
     ax.set_title(
-        f"NAIN vs NACH  (r = {r:.3f},  p = {p:.2e},  n = {mask.sum():,})",
+        f"NAIN vs NACH, blended  (r = {r:.3f},  p = {p:.2e},  n = {mask.sum():,})",
         fontsize=10,
     )
     fig.tight_layout()
@@ -232,18 +225,95 @@ def parse_args() -> argparse.Namespace:
     )
     g = p.add_mutually_exclusive_group()
     g.add_argument("--bia",       help="BIA name, e.g. 'Downtown Yonge'")
-    g.add_argument("--list-bias", action="store_true", help="Print available BIA names and exit")
+    g.add_argument("--all-bias",  action="store_true",
+                   help="Run the full pipeline for every BIA in the dataset")
+    g.add_argument("--list-bias", action="store_true",
+                   help="Print available BIA names and exit")
     p.add_argument("--depthmapxcli", type=Path, default=DEFAULT_EXE,
                    help="Path to depthmapXcli_win64.exe")
     p.add_argument("--buffer", type=float, default=BIA_BUFFER_M,
                    help="Buffer distance around BIA boundary (metres)")
     p.add_argument("--output-dir", type=Path, default=None,
-                   help="Override output directory")
+                   help="Override output directory (single-BIA mode only)")
+    p.add_argument("--citywide-csv", type=Path, default=CITYWIDE_CSV,
+                   help="Path to the citywide segment CSV used for blending")
+    p.add_argument("--local-weight", type=float, default=DEFAULT_LOCAL_WEIGHT,
+                   help="Weight given to the local score vs. citywide (0-1)")
+    p.add_argument("--citywide-tolerance", type=float, default=DEFAULT_MATCH_TOLERANCE_M,
+                   help="Max distance (m) to match a local segment to its citywide counterpart")
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Pipeline
+# Per-BIA pipeline
+# ---------------------------------------------------------------------------
+
+def _run_one(
+    bia_name:     str,
+    args:         argparse.Namespace,
+    citywide_gdf: gpd.GeoDataFrame,
+    quiet:        bool = False,
+) -> tuple[dict, gpd.GeoDataFrame] | tuple[None, None]:
+    """
+    Run the full pipeline for a single BIA.
+    Returns (summary_dict, scored_gdf) on success, (None, None) on failure.
+    scored_gdf carries a "bia" column for merging across BIAs.
+    When quiet=True all stdout from sub-steps is suppressed.
+    """
+    slug       = bia_name.strip().replace(" ", "_").replace("/", "-")
+    output_dir = args.output_dir or (OUTPUT_ROOT / slug)
+    exe        = args.depthmapxcli
+
+    _sink = io.StringIO() if quiet else sys.stdout
+    try:
+        with contextlib.redirect_stdout(_sink):
+            dxf, _, bia_gdf = extract_bia(bia_name, output_dir, buffer_m=args.buffer)
+
+            out_graph = output_dir / f"{slug}_segment_map.graph"
+            result_df = run_depthmapxcli(dxf, exe, label=slug, out_graph=out_graph)
+            print(f"  {len(result_df):,} segments\n")
+
+            print("\nComputing derived metrics...")
+            result_df = add_derived_metrics(result_df)
+
+            print("Building GeoDataFrame...")
+            gdf = build_geodataframe(result_df, TORONTO_CRS)
+
+            print("Matching against citywide segments...")
+            gdf = attach_citywide(gdf, citywide_gdf, tolerance=args.citywide_tolerance)
+            gdf = blend_scores(gdf, local_weight=args.local_weight)
+
+            print("\nComputing summary stats...")
+            summary, r, p = compute_summary(gdf)
+            print(f"  avg NAIN = {summary['avg_blended_nain']:.4f}  |  "
+                  f"avg NACH = {summary['avg_blended_nach']:.4f}  |  "
+                  f"avg length = {summary['avg_segment_length']:.1f} m  |  "
+                  f"r(NAIN,NACH) = {r:.4f}  |  "
+                  f"citywide match = {summary['pct_citywide_matched']:.1f}%")
+
+            print("\nExporting results...")
+            export_results(result_df, gdf, output_dir, slug,
+                           graph_path=out_graph, summary=summary)
+
+            print("\nRendering maps...")
+            render_map_png(gdf, bia_gdf, "blended_nain", "NAIN (70% local / 30% citywide)",
+                           output_dir / f"{slug}_nain.png")
+            render_map_png(gdf, bia_gdf, "blended_nach", "NACH (70% local / 30% citywide)",
+                           output_dir / f"{slug}_nach.png")
+            render_correlation_png(gdf, output_dir / f"{slug}_correlation.png", r, p)
+
+            gdf = gdf.copy()
+            gdf.insert(0, "bia", bia_name)
+
+        return summary, gdf
+
+    except Exception as e:
+        print(f"  FAILED [{bia_name}]: {e}", file=sys.stderr)
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -253,60 +323,80 @@ def main() -> None:
         list_bias()
         sys.exit(0)
 
-    if not args.bia:
-        sys.exit("ERROR: --bia is required.  Use --list-bias to see options.")
-
-    bia_name   = args.bia
-    slug       = bia_name.strip().replace(" ", "_").replace("/", "-")
-    output_dir = args.output_dir or (OUTPUT_ROOT / slug)
-    exe        = args.depthmapxcli
-
+    exe = args.depthmapxcli
     if not exe.exists():
         sys.exit(
             f"ERROR: depthmapXcli not found:\n  {exe}\n"
             "Pass --depthmapxcli <path> to override."
         )
 
-    # -- Step 1: Extract -------------------------------------------------------
-    dxf, _, bia_gdf = extract_bia(bia_name, output_dir, buffer_m=args.buffer)
+    if not args.citywide_csv.exists():
+        sys.exit(f"ERROR: citywide segment CSV not found:\n  {args.citywide_csv}")
+    print(f"Loading citywide segment dataset ({args.citywide_csv.name})...")
+    citywide_gdf = load_citywide(args.citywide_csv)
+    print(f"  {len(citywide_gdf):,} citywide segments loaded\n")
 
-    # -- Step 2: Segment analysis ----------------------------------------------
-    out_graph = output_dir / f"{slug}_segment_map.graph"
-    try:
-        result_df = run_depthmapxcli(dxf, exe, label=slug, out_graph=out_graph)
-    except RuntimeError as e:
-        sys.exit(f"\nFAILED: {e}")
+    if args.all_bias:
+        names = get_bia_names()
+        print(f"Running pipeline for all {len(names)} BIAs...\n")
+        rows, gdfs, failed = [], [], []
+        w = len(str(len(names)))
+        for i, name in enumerate(names, 1):
+            print(f"[{i:>{w}}/{len(names)}]  {name}...", end="", flush=True)
+            summary, gdf = _run_one(name, args, citywide_gdf, quiet=True)
+            if summary is not None:
+                print(f"  ok  "
+                      f"(NAIN={summary['avg_blended_nain']:.4f}, "
+                      f"NACH={summary['avg_blended_nach']:.4f}, "
+                      f"r={summary['blended_nain_nach_pearson_r']:.4f}, "
+                      f"match={summary['pct_citywide_matched']:.0f}%)")
+                rows.append({"bia": name, **summary})
+                gdfs.append(gdf)
+            else:
+                print("  FAILED", flush=True)
+                failed.append(name)
 
-    print(f"  {len(result_df):,} segments\n")
+        if rows:
+            summary_df  = pd.DataFrame(rows)
+            summary_csv = OUTPUT_ROOT / "all_bia_summary.csv"
+            summary_df.to_csv(summary_csv, index=False)
+            print(f"\nSummary written to: {summary_csv}")
 
-    print("\nComputing derived metrics...")
-    result_df = add_derived_metrics(result_df)
+            summary_xlsx = OUTPUT_ROOT / "space_syntax_summary.xlsx"
+            try:
+                summary_df.to_excel(summary_xlsx, sheet_name="BIA Summary", index=False)
+                print(f"Excel summary written to: {summary_xlsx}")
+            except PermissionError:
+                print(f"Excel summary skipped -- file is open elsewhere")
 
-    print("Applying length penalty...")
-    result_df = apply_length_penalty(result_df)
+        if gdfs:
+            merged = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
+            merged_gpkg = OUTPUT_ROOT / "all_bia_segment_scores.gpkg"
+            if merged_gpkg.exists():
+                try:
+                    merged_gpkg.unlink()
+                except PermissionError:
+                    pass
+            try:
+                merged.to_file(merged_gpkg, driver="GPKG")
+                print(f"Merged scored layer written to: {merged_gpkg}  ({len(merged):,} rows)")
+            except Exception as exc:
+                print(f"Merged GPKG export failed ({exc}); skipping")
 
-    print("Building GeoDataFrame...")
-    gdf = build_geodataframe(result_df, TORONTO_CRS)
+        print(f"\n{'='*60}")
+        print(f"  Done.  {len(rows)} succeeded, {len(failed)} failed.")
+        if failed:
+            print("  Failed BIAs:")
+            for n in failed:
+                print(f"    - {n}")
+        sys.exit(0 if not failed else 1)
 
-    # -- Step 3: Summary stats (computed before export so they go into the CSV) -
-    print("\nComputing summary stats...")
-    summary, r, p = compute_summary(gdf)
-    print(f"  avg NAIN = {summary['avg_nain_raw']:.4f}  |  "
-          f"avg NACH = {summary['avg_nach_raw']:.4f}  |  "
-          f"avg length = {summary['avg_segment_length']:.1f} m  |  "
-          f"r(NAIN,NACH) = {r:.4f}")
+    if not args.bia:
+        sys.exit("ERROR: --bia or --all-bias is required.  Use --list-bias to see options.")
 
-    # -- Step 4: Export --------------------------------------------------------
-    print("\nExporting results...")
-    export_results(result_df, gdf, output_dir, slug,
-                   graph_path=out_graph, summary=summary)
-
-    # -- Step 5: PNG maps ------------------------------------------------------
-    print("\nRendering maps...")
-    render_map_png(gdf, bia_gdf, "nain", "NAIN", output_dir / f"{slug}_nain.png")
-    render_map_png(gdf, bia_gdf, "nach", "NACH", output_dir / f"{slug}_nach.png")
-    render_correlation_png(gdf, output_dir / f"{slug}_correlation.png", r, p)
-
+    summary, _ = _run_one(args.bia, args, citywide_gdf, quiet=False)
+    if summary is None:
+        sys.exit(1)
     print("\nAll done.")
 
 

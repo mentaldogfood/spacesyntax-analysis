@@ -1,9 +1,12 @@
 # Space Syntax Analysis Pipeline for Toronto BIAs
 
-Runs depthmapX CLI segment analysis for spatial syntax (Normalized Angular Integration, NAIN, and Normalized Angular Choice, NACH) at BIA boundary scale (with a 800m buffer to reduce edge effects)
+This pipeline runs spatial syntax analysis for road segments for these metrics: (Normalized Angular Integration--NAIN, Normalized Angular Choice--NACH, their Pearson R correlation, segment length) at the BIA boundary scale (with a 800m buffer to reduce edge effects)
 
-Scores are joined back to road geometry and exported as scored GeoJSON, along with other key statistics which have been produced for the entire set of road segments within a BIA file
-A quick visualization of the ranked road network is exported as PNG and MIF for further processing in QGIS
+Each of the 86 BIA's total NAIN/NACH is a weighted average of its own local segment analysis and the citywide segment analysis (70% local / 30% citywide by default), to account for movement and activity at different radii.
+
+Scores are joined back to the road geometry and exported as scored GPKG/MIF, PNG, along with other key statistics which have been produced for the entire set of road segments for each BIA. Those can be found in the /outputs folder.
+
+There is also a city-wide excel worksheet which accumulates the summary statistics for all 86 BIAs, then ranks the top and bottom 5 for each category. 
 
 ## Requirements
 
@@ -11,31 +14,59 @@ A quick visualization of the ranked road network is exported as PNG and MIF for 
 pip install -r requirements.txt
 ```
 
+The DepthmapX CLI, developed by Space Syntax at UCL, is already attached within the repo. However you could find them here:
+
 DepthmapX CLI download: https://github.com/SpaceGroupUCL/depthmapX/releases
-Add `depthmapXcli.exe` to PATH or pass `--depthmapx "C:/path/depthmapXcli.exe"`
+
 
 ## Usage
 
-main.py — full Space Syntax pipeline for Toronto BIAs.
+main.py — runs full Space Syntax pipeline for any, or all of Toronto BIAs.
 
-Orchestrates:
-  1. extract_bia        : clip road centrelines, export as DXF
-  2. depthmapx_segment  : run depthmapXcli angular segment analysis,
-                          compute derived metrics, export .graph / MIF / CSV
-  3. Summary stats      : avg NAIN, avg NACH, avg segment length, NAIN-NACH Pearson r
-                          appended as a summary section in segment_scores.csv
-  4. PNG maps           : NAIN spectral map, NACH spectral map, NAIN-NACH scatter plot
+1. extract_bia: clip road centrelines to buffered BIA boundaries, then export as DXF
 
-Usage:
+2. depthmapx_segment: run depthmapXcli angular segment analysis, compute derived metrics, export .graph/MIF/GPKG/CSV
+
+3. citywide_match: match each local segment to its citywide counterpart (which I pregenerated manually using the depthmapX GUI, as the file citywide_Segment_Map.csv). 
+                          
+the spatial join was performed based on proximity, within a distance tolerance. the local + citywide NAIN/NACH is also weighted in this step.
+
+4. outputs/summary stats: avg local/citywide/blended NAIN & NACH, avg segment length, blended NAIN-NACH Pearson r, % of segments matched to a citywide counterpart — appended as a summary section in segment_scores.csv, and rolled up across all BIAs into outputs/all_bia_summary.csv + outputs/space_syntax_summary.xlsx
+
+5. outputs/visualization: NAIN spectral map, NACH spectral map, blended NAIN-NACH scatter plot as PNGs, GPKG and MIF files for each BIA to process using GIS softwares
+
+
+Running the analysis
 ```
+Running full analysis on one BIA:
+
 python scripts/main.py --bia "Downtown Yonge"
+
+Checking list of BIA names:
+
 python scripts/main.py --list-bias
+
+Running full analysis on all BIAs:
+
+python scripts/main.py --all-bias
+```
+
+Options for the local/citywide blend:
+```
+adjusting weight on the local score (citywide gets 1 - this)
+
+--local-weight 0.7          
+```
+Or if you only want the dxfs, after buffering and clipping:
+```
 python scripts/extract_bia.py --bia "Bloor West Village"
 python scripts/extract_bia.py --list-bias
 ```
+And to run statistics on the city-wide NACH and NAIN data
+```
+python scripts/citywide_analysis.py
+```
 ## Methodology
-
-The DepthMapX CLI's built- in angular segment analysis tool returns 
 
 Key statistical terms and formulas are derived from these pieces of literature
 
@@ -55,18 +86,18 @@ How often is a street chosen in the commute path between two points within the s
 
 =log(value("T1024 Choice")+1)/log(value("T1024 Total Depth")+3)
 
-**Segment Adjustment**
+**Local / Citywide Weighted Average**
 
-A penalization formula added to lower the NAIN and NACH scores of long segments, as normalized to the BIA range. 
+Local (per-BIA) and citywide segment analyses are two independent depthmapX runs — different segmentations, no shared segment ID — so each local segment is matched to its nearest citywide segment by geometry
 
-norm_len     = (L - L_min) / (L_max - L_min)        # min-max within BIA, [0, 1]
+local_nain, local_nach   — this BIA's own segment analysis
+citywide_nain, citywide_nach  — the matched segment's citywide-scale analysis
+blended_nain = local_weight × local_nain + (1 − local_weight) × citywide_nain
+blended_nach = local_weight × local_nach + (1 − local_weight) × citywide_nach
 
-length_penalty = 1 - (norm_len ^ 1.5) * 0.3
+Default `local_weight` = 0.7 (70% local / 30% citywide).
 
-NAIN_adjusted  = nain  × length_penalty
-NACH_adjusted  = nach  × length_penalty
-
-**INCH (Correlation)**
+**INCH (Correlation, Pearson R)**
 
 Measure accessibility, or how closely aligned are the well-integrated streets with the high commuter-traffic streets.
 
