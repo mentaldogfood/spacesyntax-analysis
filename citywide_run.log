@@ -1,0 +1,21 @@
+  FAILED [citywide]: depthmapXcli Analyse timed out after 7200 s
+Loading citywide segment dataset (prerun citywide segment map.csv)...
+  71,470 citywide segments loaded
+
+Running pipeline for the entire road network (no clipping)...
+
+
+============================================================
+  Extracting citywide network (no clipping)
+  Output         : C:\Users\menta\OneDrive - University of Toronto\udsc cui\walkability playbook\space syntax\spacesyntax-analysis\outputs\Citywide
+============================================================
+
+Loading data...
+  53,165 road features loaded
+
+Exploding to individual linestrings...
+  53,165 segments after explode
+    DXF written: Citywide_centerlines.dxf  (53,165 polylines)
+    GeoPackage   : Citywide_centerlines.gpkg
+
+  Running depthmapXcli  [Citywide]...
